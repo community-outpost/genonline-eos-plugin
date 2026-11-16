@@ -1,0 +1,117 @@
+# SPDX-License-Identifier: MIT
+# Builds and tests the plugin through its CMake presets and uploads each staged plugin folder.
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The EOS SDK package is pinned by digest, and its zip by SHA-256. A PENDING digest stops the build.
+  EOS_SDK_PACKAGE: ghcr.io/community-outpost/eos-sdk
+  EOS_SDK_DIGEST: sha256:eeba5a8e64758f30761815660e867397e942407147b7871265b3703831bc9143
+  EOS_SDK_ZIP: eos-sdk-1.18.1.zip
+  EOS_SDK_ZIP_SHA256: 6751984c13ef720cf4df7ad4efb4b1c12d0c29ed5570a12c20b21d3e866736d3
+  ORAS_VERSION: 1.2.0
+
+jobs:
+  build:
+    name: build (${{ matrix.preset }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows x86, the target the game ships, with both Windows compilers.
+          - preset: win32-msvc
+            os: windows-latest
+          - preset: win32-clang
+            os: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v7
+        with:
+          path: genonline-eos-plugin
+          persist-credentials: false
+
+      - name: Check out the plugin SDK
+        uses: actions/checkout@v7
+        with:
+          repository: community-outpost/genonline-plugin-sdk
+          ssh-key: ${{ secrets.SDK_DEPLOY_KEY }}
+          path: genonline-plugin-sdk
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v2
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      - name: Pull and unpack the EOS SDK
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ "$EOS_SDK_DIGEST" = "PENDING" ]; then
+            echo "The EOS SDK package digest is not pinned yet. Set EOS_SDK_DIGEST at the top of this workflow." >&2
+            exit 1
+          fi
+          download="$RUNNER_TEMP/eos-sdk"
+          mkdir -p "$download"
+          printf '%s' "$REGISTRY_TOKEN" | oras login ghcr.io --username "$REGISTRY_USER" --password-stdin > /dev/null
+          oras pull "$EOS_SDK_PACKAGE@$EOS_SDK_DIGEST" --output "$download" > /dev/null
+          oras logout ghcr.io > /dev/null
+          python genonline-eos-plugin/.github/scripts/unpack_eos_sdk.py \
+            "$download/$EOS_SDK_ZIP" "$EOS_SDK_ZIP_SHA256" genonline-eos-plugin/EOS
+          rm -rf "$download"
+
+      - name: Configure
+        env:
+          GENONLINE_EOS_PRODUCT_ID: ${{ secrets.GENONLINE_EOS_PRODUCT_ID }}
+          GENONLINE_EOS_SANDBOX_ID: ${{ secrets.GENONLINE_EOS_SANDBOX_ID }}
+          GENONLINE_EOS_DEPLOYMENT_ID: ${{ secrets.GENONLINE_EOS_DEPLOYMENT_ID }}
+          GENONLINE_EOS_CLIENT_ID: ${{ secrets.GENONLINE_EOS_CLIENT_ID }}
+          GENONLINE_EOS_CLIENT_SECRET: ${{ secrets.GENONLINE_EOS_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          # Missing secrets arrive as empty strings, which builds a plugin without credentials.
+          cmake -S genonline-eos-plugin --preset ${{ matrix.preset }} \
+            "-DGENONLINE_EOS_PRODUCT_ID=$GENONLINE_EOS_PRODUCT_ID" \
+            "-DGENONLINE_EOS_SANDBOX_ID=$GENONLINE_EOS_SANDBOX_ID" \
+            "-DGENONLINE_EOS_DEPLOYMENT_ID=$GENONLINE_EOS_DEPLOYMENT_ID" \
+            "-DGENONLINE_EOS_CLIENT_ID=$GENONLINE_EOS_CLIENT_ID" \
+            "-DGENONLINE_EOS_CLIENT_SECRET=$GENONLINE_EOS_CLIENT_SECRET"
+
+      - name: Build
+        working-directory: genonline-eos-plugin
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+
+      - name: Test
+        working-directory: genonline-eos-plugin
+        run: ctest --preset ${{ matrix.preset }}
+
+      - name: Upload the staged plugin folder
+        uses: actions/upload-artifact@v7
+        with:
+          name: genonline_eos-${{ matrix.preset }}
+          path: genonline-eos-plugin/build/${{ matrix.preset }}/plugins/genonline_eos/
+          if-no-files-found: error
+          retention-days: 14
