@@ -1,0 +1,128 @@
+# SPDX-License-Identifier: MIT
+# Builds and tests the 32-bit plugin and uploads the staged plugin folder.
+name: build
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The EOS SDK package is pinned by digest, and its zip by SHA-256.
+  EOS_SDK_IMAGE: ghcr.io/community-outpost/eos-sdk@sha256:3ca050c454c6d5e149d0584ebdc94f7415d8d935e633208ceaa6ea52392bd555
+  EOS_SDK_ZIP: eos-sdk-1.18.1.zip
+  EOS_SDK_ZIP_SHA256: 947afb228984874661c099e0f85196602a4581cb3912813678dad8dfdf8ed5e6
+  ORAS_VERSION: 1.2.0
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out the plugin
+        uses: actions/checkout@v4
+        with:
+          path: genonline-eos-plugin
+          persist-credentials: false
+
+      - name: Check out the plugin SDK
+        uses: actions/checkout@v4
+        with:
+          repository: community-outpost/genonline-plugin-sdk
+          ssh-key: ${{ secrets.SDK_DEPLOY_KEY }}
+          path: genonline-plugin-sdk
+          persist-credentials: false
+
+      - name: Install oras
+        uses: oras-project/setup-oras@v1
+        with:
+          version: ${{ env.ORAS_VERSION }}
+
+      - name: Pull the EOS SDK
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $download = Join-Path $env:RUNNER_TEMP 'eos-sdk'
+          New-Item -ItemType Directory -Force -Path $download | Out-Null
+          $env:REGISTRY_TOKEN | oras login ghcr.io --username $env:REGISTRY_USER --password-stdin
+          if ($LASTEXITCODE -ne 0) { throw 'oras login failed' }
+          oras pull $env:EOS_SDK_IMAGE --output $download | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'oras pull failed' }
+          oras logout ghcr.io | Out-Null
+          $zip = Join-Path $download $env:EOS_SDK_ZIP
+          if (-not (Test-Path -LiteralPath $zip)) { throw "The package holds no $env:EOS_SDK_ZIP" }
+          $hash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($hash -ne $env:EOS_SDK_ZIP_SHA256) { throw "$env:EOS_SDK_ZIP has SHA-256 $hash, expected $env:EOS_SDK_ZIP_SHA256" }
+          Write-Host "$env:EOS_SDK_ZIP matches its pinned SHA-256"
+
+      - name: Unpack the EOS SDK
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = Join-Path (Join-Path $env:RUNNER_TEMP 'eos-sdk') $env:EOS_SDK_ZIP
+          $eos = Join-Path $env:GITHUB_WORKSPACE 'genonline-eos-plugin/EOS'
+          Expand-Archive -LiteralPath $zip -DestinationPath $eos -Force
+          # A zip with one top folder is flattened so EOS holds Include, Lib and Bin directly.
+          if (-not (Test-Path -LiteralPath (Join-Path $eos 'Include/eos_sdk.h'))) {
+            $inner = Get-ChildItem -LiteralPath $eos -Directory | Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'Include/eos_sdk.h') } | Select-Object -First 1
+            if ($null -eq $inner) { throw 'The EOS SDK zip holds no Include/eos_sdk.h' }
+            Get-ChildItem -LiteralPath $inner.FullName -Force | Move-Item -Destination $eos
+            Remove-Item -LiteralPath $inner.FullName -Recurse -Force
+          }
+          foreach ($required in 'Include/eos_sdk.h', 'Lib/EOSSDK-Win32-Shipping.lib', 'Bin/EOSSDK-Win32-Shipping.dll') {
+            if (-not (Test-Path -LiteralPath (Join-Path $eos $required))) { throw "The EOS SDK lacks $required" }
+          }
+          Remove-Item -LiteralPath (Join-Path $env:RUNNER_TEMP 'eos-sdk') -Recurse -Force
+
+      - name: Configure
+        env:
+          GENONLINE_EOS_PRODUCT_ID: ${{ secrets.GENONLINE_EOS_PRODUCT_ID }}
+          GENONLINE_EOS_SANDBOX_ID: ${{ secrets.GENONLINE_EOS_SANDBOX_ID }}
+          GENONLINE_EOS_DEPLOYMENT_ID: ${{ secrets.GENONLINE_EOS_DEPLOYMENT_ID }}
+          GENONLINE_EOS_CLIENT_ID: ${{ secrets.GENONLINE_EOS_CLIENT_ID }}
+          GENONLINE_EOS_CLIENT_SECRET: ${{ secrets.GENONLINE_EOS_CLIENT_SECRET }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Missing secrets arrive as empty strings, which builds a plugin without credentials.
+          # Without -G CMake picks the newest Visual Studio on the runner, a multi-config generator.
+          $arguments = @(
+            '-S', 'genonline-eos-plugin',
+            '-B', 'build',
+            '-A', 'Win32',
+            "-DGENONLINE_EOS_PRODUCT_ID=$env:GENONLINE_EOS_PRODUCT_ID",
+            "-DGENONLINE_EOS_SANDBOX_ID=$env:GENONLINE_EOS_SANDBOX_ID",
+            "-DGENONLINE_EOS_DEPLOYMENT_ID=$env:GENONLINE_EOS_DEPLOYMENT_ID",
+            "-DGENONLINE_EOS_CLIENT_ID=$env:GENONLINE_EOS_CLIENT_ID",
+            "-DGENONLINE_EOS_CLIENT_SECRET=$env:GENONLINE_EOS_CLIENT_SECRET"
+          )
+          cmake @arguments
+          if ($LASTEXITCODE -ne 0) { throw 'CMake configure failed' }
+
+      - name: Build
+        run: |
+          cmake --build build --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw 'The build failed' }
+
+      - name: Test
+        run: |
+          ctest --test-dir build -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw 'Tests failed' }
+
+      - name: Upload the staged plugin folder
+        uses: actions/upload-artifact@v4
+        with:
+          name: genonline_eos
+          path: build/plugins/genonline_eos/
+          if-no-files-found: error
+          retention-days: 14
